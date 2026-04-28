@@ -1,0 +1,571 @@
+<!doctype html>
+<html lang="id">
+  <head>
+    <title>WebXR Medical: Simulasi AR Radiologi Interaktif</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <link type="text/css" rel="stylesheet" href="https://xrblocks.github.io/css/xr.css" />
+    <script>window.litDisableBundleWarning = true;</script>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/",
+          "troika-three-text": "https://cdn.jsdelivr.net/gh/protectwise/troika@028b81cf308f0f22e5aa8e78196be56ec1997af5/packages/troika-three-text/src/index.js",
+          "troika-three-utils": "https://cdn.jsdelivr.net/gh/protectwise/troika@v0.52.4/packages/troika-three-utils/src/index.js",
+          "troika-worker-utils": "https://cdn.jsdelivr.net/gh/protectwise/troika@v0.52.4/packages/troika-worker-utils/src/index.js",
+          "bidi-js": "https://esm.sh/bidi-js@%5E1.0.2?target=es2022",
+          "webgl-sdf-generator": "https://esm.sh/webgl-sdf-generator@1.1.1/es2022/webgl-sdf-generator.mjs",
+          "lit": "https://cdn.jsdelivr.net/gh/lit/dist@3/core/lit-core.min.js",
+          "lit/": "https://esm.run/lit@3/",
+          "xrblocks": "https://cdn.jsdelivr.net/npm/xrblocks@0.11.0/build/xrblocks.js",
+          "xrblocks/addons/": "https://cdn.jsdelivr.net/npm/xrblocks@0.11.0/build/addons/",
+          "@google/genai": "https://cdn.jsdelivr.net/npm/@google/genai/+esm"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <script type="module">
+      import * as THREE from 'three';
+      import * as xb from 'xrblocks';
+
+      /**
+       * Simulasi AR Radiologi berfokus pada panduan pemosisian pasien
+       * dan pengaturan alat pencitraan dengan instruksi real-time.
+       */
+      class RadiologiAR extends xb.Script {
+        constructor() {
+          super();
+          
+          // Alur Prosedur: ALIGN_TUBE -> POSITION_PATIENT -> COLLIMATION -> EXPOSURE -> FINISH
+          this.state = 'ALIGN_TUBE';
+          
+          // Metrik Teknis
+          this.targetSID = 1.0; // 100 cm dalam unit 3D
+          this.currentSID = 0;
+          this.isAligned = false;
+          
+          this.audioContext = null;
+          this.isProcessingAI = false;
+        }
+
+        init() {
+          // Pencahayaan
+          this.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2));
+          const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+          dirLight.position.set(0, 5, 2);
+          this.add(dirLight);
+
+          this.setupEnvironment();
+          this.setupHUD();
+          this.setupControlPanels();
+          this.setupAIPanel();
+          
+          this.updateFlow();
+        }
+
+        setupEnvironment() {
+          // 1. Detektor (Bucky Stand) - Posisi Tetap
+          const detectorGeo = new THREE.BoxGeometry(0.5, 0.6, 0.05);
+          const detectorMat = new THREE.MeshPhongMaterial({ color: 0x222222 });
+          this.detector = new THREE.Mesh(detectorGeo, detectorMat);
+          this.detector.position.set(0, 1.3, -2.0);
+          this.add(this.detector);
+
+          // 2. Pasien (Bentuk Minion 3D)
+          this.patient = this.createMinion();
+          this.patient.position.set(0, 0.3, -1.8); // Posisi dasar pasien sedikit diturunkan
+          this.patient.scale.set(2.5, 2.5, 2.5); // Perbesar skala minion agar proporsional
+          this.add(this.patient);
+
+          // 3. Tabung Sinar-X (X-Ray Tube)
+          const tubeGroup = new THREE.Group();
+          const tubeGeo = new THREE.CylinderGeometry(0.1, 0.1, 0.4);
+          const tubeMat = new THREE.MeshPhongMaterial({ color: 0xdddddd });
+          const tubeMesh = new THREE.Mesh(tubeGeo, tubeMat);
+          tubeMesh.rotation.z = Math.PI / 2;
+          tubeGroup.add(tubeMesh);
+
+          // Kolimator Beam (Cahaya representasi sinar-X)
+          const beamGeo = new THREE.ConeGeometry(0.3, 1.5, 16);
+          const beamMat = new THREE.MeshBasicMaterial({ 
+            color: 0xffff00, 
+            transparent: true, 
+            opacity: 0.0 // Awalnya tidak terlihat
+          });
+          this.xrayBeam = new THREE.Mesh(beamGeo, beamMat);
+          this.xrayBeam.position.set(0, 0, -0.75);
+          this.xrayBeam.rotation.x = -Math.PI / 2;
+          tubeGroup.add(this.xrayBeam);
+
+          // Posisi awal tabung (sengaja salah agar diatur pengguna)
+          tubeGroup.position.set(0, 1.0, -0.6); 
+          this.tube = tubeGroup;
+          this.add(this.tube);
+        }
+
+        setupHUD() {
+          // HUD Utama untuk Instruksi AR
+          this.hudPanel = new xb.SpatialPanel({
+            width: 1.3, // Kolom diperkecil dari 1.6
+            height: 0.7, // Kolom diperkecil dari 0.8
+            backgroundColor: '#001a33ee'
+          });
+          this.hudPanel.isRoot = true; 
+          this.hudPanel.position.set(0, 2.2, -1.5);
+          this.add(this.hudPanel);
+
+          const grid = this.hudPanel.addGrid();
+          
+          // Judul
+          grid.addRow({weight: 0.15}).addText({ text: 'PANDUAN KLINIS AR', fontSize: 0.07, fontColor: '#00ffcc' }); // Font diperbesar
+          
+          // Instruksi
+          this.hudInstruction = grid.addRow({weight: 0.4}).addText({ 
+            text: 'Instruksi memuat...', 
+            fontSize: 0.075, // Font instruksi diperbesar
+            fontColor: '#ffffff' 
+          });
+
+          // Telemetri Teknis Real-time
+          this.hudTelemetry = grid.addRow({weight: 0.2}).addText({ 
+            text: 'SID: -- cm | Penyelarasan: --', 
+            fontSize: 0.06, // Font telemetri diperbesar
+            fontColor: '#aaaaaa' 
+          });
+
+          // Tombol Navigasi (Kembali & Validasi)
+          const btnRow = grid.addRow({weight: 0.25});
+          
+          this.btnKembali = btnRow.addCol({weight: 0.35}).addTextButton({ 
+            text: '◀ Kembali', 
+            backgroundColor: '#666666',
+            fontSize: 0.07 // Font tombol besar
+          });
+          this.btnKembali.onTriggered = () => { this.goBack(); };
+
+          this.btnValidasi = btnRow.addCol({weight: 0.65}).addTextButton({ 
+            text: 'Validasi & Lanjut ▶', 
+            backgroundColor: '#0066cc',
+            fontSize: 0.07 // Font tombol besar
+          });
+          this.btnValidasi.onTriggered = () => { this.validateStep(); };
+
+          // Mengkalkulasi batasan layout
+          this.hudPanel.updateLayouts();
+        }
+
+        setupControlPanels() {
+          // Panel Tabung Sinar-X
+          this.tubePanel = new xb.SpatialPanel({ width: 0.8, height: 0.5, backgroundColor: '#333333dd' }); // Panel lebih kecil
+          this.tubePanel.isRoot = true;
+          this.tubePanel.position.set(0.7, 1.0, -0.6);
+          this.add(this.tubePanel);
+
+          const tubeGrid = this.tubePanel.addGrid();
+          tubeGrid.addRow({weight: 0.3}).addText({ text: 'Kontrol Tabung Sinar-X', fontSize: 0.07 }); // Font membesar
+          const tBtnRow1 = tubeGrid.addRow({weight: 0.35});
+          const tBtnRow2 = tubeGrid.addRow({weight: 0.35});
+          
+          tBtnRow1.addCol().addTextButton({ text: '▲ Naik', backgroundColor: '#555555', fontSize: 0.07 })
+            .onTriggered = () => { this.tube.position.y += 0.05; };
+          tBtnRow1.addCol().addTextButton({ text: '▼ Turun', backgroundColor: '#555555', fontSize: 0.07 })
+            .onTriggered = () => { this.tube.position.y -= 0.05; };
+          
+          tBtnRow2.addCol().addTextButton({ text: 'Maju', backgroundColor: '#555555', fontSize: 0.07 })
+            .onTriggered = () => { this.tube.position.z -= 0.05; };
+          tBtnRow2.addCol().addTextButton({ text: 'Mundur', backgroundColor: '#555555', fontSize: 0.07 })
+            .onTriggered = () => { this.tube.position.z += 0.05; };
+
+          // Panel Pasien
+          this.patientPanel = new xb.SpatialPanel({ width: 0.8, height: 0.4, backgroundColor: '#333333dd' }); // Panel lebih kecil
+          this.patientPanel.isRoot = true;
+          this.patientPanel.position.set(-0.9, 1.2, -1.8);
+          this.add(this.patientPanel);
+
+          const patGrid = this.patientPanel.addGrid();
+          patGrid.addRow({weight: 0.4}).addText({ text: 'Pemosisian Pasien', fontSize: 0.07 }); // Font membesar
+          const pBtnRow = patGrid.addRow({weight: 0.6});
+          
+          pBtnRow.addCol().addTextButton({ text: '⟲ Putar Kiri', backgroundColor: '#555555', fontSize: 0.07 })
+            .onTriggered = () => { this.patient.rotation.y += Math.PI / 8; };
+          pBtnRow.addCol().addTextButton({ text: '⟳ Putar Kanan', backgroundColor: '#555555', fontSize: 0.07 })
+            .onTriggered = () => { this.patient.rotation.y -= Math.PI / 8; };
+
+          // Panel Eksposi
+          this.exposurePanel = new xb.SpatialPanel({ width: 0.8, height: 0.45, backgroundColor: '#551111dd' }); // Panel lebih kecil
+          this.exposurePanel.isRoot = true;
+          this.exposurePanel.position.set(0.6, 1.2, -0.6);
+          this.add(this.exposurePanel);
+
+          const expGrid = this.exposurePanel.addGrid();
+          expGrid.addRow({weight: 0.3}).addText({ text: 'Parameter Eksposi', fontSize: 0.07 }); // Font membesar
+          expGrid.addRow({weight: 0.3}).addText({ text: '80 kVp | 20 mAs', fontSize: 0.08, fontColor: '#ffcc00' });
+          const expBtn = expGrid.addRow({weight: 0.4}).addCol().addTextButton({ 
+            text: 'EKSPOSI', 
+            backgroundColor: '#ff0000',
+            fontSize: 0.09 // Tombol eksposi sangat besar
+          });
+          expBtn.onTriggered = () => { this.triggerExposure(); };
+
+          // Mengkalkulasi batasan layout untuk menghindari error render
+          this.tubePanel.updateLayouts();
+          this.patientPanel.updateLayouts();
+          this.exposurePanel.updateLayouts();
+        }
+
+        setupAIPanel() {
+          // Panel Asisten AI
+          this.aiPanel = new xb.SpatialPanel({ width: 1.1, height: 0.9, backgroundColor: '#113322dd' }); // Diperkecil dari 1.4x1.2
+          this.aiPanel.isRoot = true;
+          this.aiPanel.position.set(1.5, 1.8, -1.2);
+          this.aiPanel.rotation.y = -Math.PI / 4;
+          this.add(this.aiPanel);
+
+          const grid = this.aiPanel.addGrid();
+          grid.addRow({weight: 0.15}).addText({text: 'Asisten AI Radiologi ✨', fontSize: 0.07, fontColor: '#00ffcc'});
+
+          const responseRow = grid.addRow({weight: 0.55});
+          this.aiResponseText = new xb.ScrollingTroikaTextView({ 
+            text: 'Halo! Saya asisten AI Anda. Gunakan tombol di bawah untuk bertanya seputar prosedur teknis ini.', 
+            fontSize: 0.06 // Font chat lebih besar
+          });
+          responseRow.add(this.aiResponseText);
+
+          const btnRow1 = grid.addRow({weight: 0.15});
+          
+          const btn1 = btnRow1.addCol().addTextButton({ text: '✨ Parameter', backgroundColor: '#0066cc', fontSize: 0.06 });
+          btn1.onTriggered = () => this.askAI('Berapa parameter eksposi (kVp dan mAs) yang optimal untuk X-Ray Thorax posisi Lateral pada orang dewasa? Jawab dengan singkat.');
+
+          const btn2 = btnRow1.addCol().addTextButton({ text: '✨ Tips Posisi', backgroundColor: '#0066cc', fontSize: 0.06 });
+          btn2.onTriggered = () => this.askAI('Berikan 2 tips klinis singkat cara memposisikan pasien untuk X-Ray Thorax Lateral yang benar.');
+
+          const btnRow2 = grid.addRow({weight: 0.15});
+          
+          const btn3 = btnRow2.addCol().addTextButton({ text: '✨ Evaluasi Visual', backgroundColor: '#8833cc', fontSize: 0.06 });
+          btn3.onTriggered = () => this.askAIVisual();
+
+          const btn4 = btnRow2.addCol().addTextButton({ text: '✨ Skenario Baru', backgroundColor: '#cc6600', fontSize: 0.06 });
+          btn4.onTriggered = () => this.askAICase();
+
+          // Mengkalkulasi batasan layout AI panel (sangat penting untuk teks bergulir)
+          this.aiPanel.updateLayouts();
+        }
+
+        async askAI(prompt) {
+          if (this.isProcessingAI) return;
+          if (!xb.core.ai?.isAvailable()) {
+            this.aiResponseText.setText('❌ AI tidak tersedia. Pastikan API key sudah dikonfigurasi.');
+            return;
+          }
+          
+          this.isProcessingAI = true;
+          this.aiResponseText.setText(`Anda: ${prompt}\n\n✨ Memproses jawaban...`);
+
+          try {
+            const response = await xb.core.ai.query({
+              type: 'multiPart',
+              parts: [{text: prompt}]
+            });
+            this.aiResponseText.setText(`Anda: ${prompt}\n\n✨ AI:\n${response.text}`);
+          } catch (e) {
+            this.aiResponseText.setText(`❌ Error: ${e.message}`);
+          }
+          this.isProcessingAI = false;
+        }
+
+        async askAIVisual() {
+          if (this.isProcessingAI) return;
+          if (!xb.core.ai?.isAvailable()) {
+            this.aiResponseText.setText('❌ AI tidak tersedia. Pastikan API key sudah dikonfigurasi.');
+            return;
+          }
+          
+          this.isProcessingAI = true;
+          this.aiResponseText.setText(`✨ Mengambil gambar lingkungan AR Anda dan menganalisis secara visual...`);
+
+          try {
+            // Mengambil tangkapan layar AR saat ini menggunakan fitur dari XR Blocks
+            const base64Image = await xb.core.screenshotSynthesizer.getScreenshot();
+            if (!base64Image) throw new Error("Gagal mengambil tangkapan layar AR.");
+            
+            // Membersihkan header 'data:image/png;base64,' untuk API Gemini
+            const base64Data = base64Image.startsWith('data:') ? base64Image.split(',')[1] : base64Image;
+            const prompt = "Anda adalah instruktur radiologi klinis. Ini adalah tangkapan layar dari sudut pandang simulasi AR saya. Evaluasi posisi alat (seperti silinder tabung sinar-X) dan pasien. Apakah terlihat sudah sejajar di tengah area penangkap gambar? Berikan saran perbaikan klinis dalam 2 kalimat singkat.";
+            
+            const response = await xb.core.ai.query({
+              type: 'multiPart',
+              parts: [
+                { inlineData: { mimeType: 'image/png', data: base64Data } },
+                { text: prompt }
+              ]
+            });
+            this.aiResponseText.setText(`📸 [Analisis Gambar Berhasil]\n\n✨ Evaluasi Visual Instruktur:\n${response.text}`);
+          } catch (e) {
+            this.aiResponseText.setText(`❌ Error Visual AI: ${e.message}`);
+          }
+          this.isProcessingAI = false;
+        }
+
+        async askAICase() {
+          if (this.isProcessingAI) return;
+          if (!xb.core.ai?.isAvailable()) return;
+          
+          this.isProcessingAI = true;
+          this.aiResponseText.setText(`✨ Menghasilkan skenario klinis acak...`);
+
+          try {
+            const response = await xb.core.ai.query({
+              type: 'multiPart',
+              parts: [{text: 'Buatkan 1 skenario pasien fiktif singkat (maksimal 2 kalimat) yang masuk IGD dan memerlukan pemeriksaan X-Ray. Sebutkan juga indikasi klinisnya.'}]
+            });
+            this.aiResponseText.setText(`✨ Kasus Klinis Baru:\n${response.text}\n\nSilakan atur posisi tabung dan pasien sesuai kebutuhan kasus di atas.`);
+          } catch (e) {
+            this.aiResponseText.setText(`❌ Error: ${e.message}`);
+          }
+          this.isProcessingAI = false;
+        }
+
+        update() {
+          super.update();
+          
+          // Kalkulasi Telemetri Real-time
+          this.currentSID = Math.abs(this.tube.position.z - this.detector.position.z);
+          const heightDiff = Math.abs(this.tube.position.y - this.detector.position.y);
+          this.isAligned = heightDiff < 0.05;
+
+          const sidCm = Math.round(this.currentSID * 100);
+          const alignText = this.isAligned ? 'Tengah (Akurat)' : 'Melenceng';
+          let color = (sidCm === 100 && this.isAligned) ? '#00ff00' : '#ff9900';
+
+          if (this.state !== 'FINISH') {
+            this.hudTelemetry.setText(`Telemetri AR | SID: ${sidCm} cm | Penyelarasan: ${alignText}`);
+            this.hudTelemetry.fontColor = color;
+          }
+        }
+
+        goBack() {
+          if (this.state === 'POSITION_PATIENT') {
+            this.state = 'ALIGN_TUBE';
+          } else if (this.state === 'COLLIMATION') {
+            this.state = 'POSITION_PATIENT';
+            this.xrayBeam.material.opacity = 0.0; // Sembunyikan laser kuning
+          } else if (this.state === 'EXPOSURE') {
+            this.state = 'COLLIMATION';
+          }
+          this.updateFlow();
+        }
+
+        updateFlow() {
+          // Sembunyikan panel dengan skala 0 agar tidak memblokir klik (Raycast)
+          this.tubePanel.scale.set(0, 0, 0);
+          this.patientPanel.scale.set(0, 0, 0);
+          this.exposurePanel.scale.set(0, 0, 0);
+
+          // Reset visibilitas
+          this.tubePanel.visible = false;
+          this.patientPanel.visible = false;
+          this.exposurePanel.visible = false;
+          this.btnValidasi.visible = true;
+          this.btnKembali.visible = true;
+          this.xrayBeam.material.opacity = 0.0;
+
+          switch (this.state) {
+            case 'ALIGN_TUBE':
+              this.btnKembali.visible = false; // Tidak ada tombol back di awal
+              this.hudInstruction.setText('Langkah 1: Atur posisi tabung. Target SID: 100cm & sejajar dengan Detektor.');
+              this.tubePanel.visible = true;
+              this.tubePanel.scale.set(1, 1, 1); // Kembalikan skala
+              break;
+
+            case 'POSITION_PATIENT':
+              this.hudInstruction.setText('Langkah 2: Rotasikan pasien untuk posisi Lateral (menyamping ke detektor).');
+              this.patientPanel.visible = true;
+              this.patientPanel.scale.set(1, 1, 1); // Kembalikan skala
+              break;
+
+            case 'COLLIMATION':
+              this.hudInstruction.setText('Langkah 3: Area kolimasi (cahaya) diaktifkan. Validasi area penyinaran.');
+              this.xrayBeam.material.color.setHex(0xffff00); // Cahaya kuning kolimator
+              this.xrayBeam.material.opacity = 0.3;
+              break;
+
+            case 'EXPOSURE':
+              this.hudInstruction.setText('Langkah 4: Pemosisian optimal. Lakukan Eksposi pada panel kontrol.');
+              this.btnValidasi.visible = false;
+              this.exposurePanel.visible = true;
+              this.exposurePanel.scale.set(1, 1, 1); // Kembalikan skala
+              break;
+
+            case 'FINISH':
+              this.hudInstruction.setText('Prosedur Selesai. Gambar berhasil diambil dengan presisi.');
+              this.hudInstruction.fontColor = '#00ff00';
+              this.hudTelemetry.setText('Status: Pencitraan Optimal');
+              this.btnValidasi.visible = false;
+              this.btnKembali.visible = false;
+              break;
+          }
+          
+          // Perbarui layout setiap kali visibilitas tombol berubah
+          this.hudPanel.updateLayouts();
+        }
+
+        validateStep() {
+          if (this.state === 'ALIGN_TUBE') {
+            const sidCm = Math.round(this.currentSID * 100);
+            if (sidCm >= 95 && sidCm <= 105 && this.isAligned) {
+              this.state = 'POSITION_PATIENT';
+              this.updateFlow();
+            } else {
+              this.hudInstruction.setText('Validasi Gagal: Pastikan SID ~100cm dan tinggi sejajar!');
+              this.hudInstruction.fontColor = '#ff0000';
+              setTimeout(() => { 
+                this.hudInstruction.fontColor = '#ffffff'; 
+                this.updateFlow(); 
+              }, 3000);
+            }
+          } 
+          else if (this.state === 'POSITION_PATIENT') {
+            // Cek apakah pasien menghadap ke samping (Lateral) -> rotasi sekitar 90 derajat (Math.PI/2)
+            const rotY = Math.abs(this.patient.rotation.y % (Math.PI));
+            if (rotY > 1.0 && rotY < 2.0) { // Toleransi kasar untuk ~90 derajat
+              this.state = 'COLLIMATION';
+              this.updateFlow();
+            } else {
+              this.hudInstruction.setText('Validasi Gagal: Pasien belum dalam posisi Lateral (menyamping)!');
+              this.hudInstruction.fontColor = '#ff0000';
+              setTimeout(() => { 
+                this.hudInstruction.fontColor = '#ffffff'; 
+                this.updateFlow(); 
+              }, 3000);
+            }
+          }
+          else if (this.state === 'COLLIMATION') {
+            this.state = 'EXPOSURE';
+            this.updateFlow();
+          }
+        }
+
+        triggerExposure() {
+          // Visual & Audio Sinar-X Aktif
+          this.playBeep();
+          this.xrayBeam.material.color.setHex(0x00ffff); // Berubah biru cyan saat sinar-X aktif
+          this.xrayBeam.material.opacity = 0.6;
+          
+          this.hudInstruction.setText('MENGAMBIL GAMBAR X-RAY...');
+          this.hudInstruction.fontColor = '#00ffff';
+          this.exposurePanel.visible = false;
+
+          setTimeout(() => {
+            this.state = 'FINISH';
+            this.updateFlow();
+          }, 1500);
+        }
+
+        playBeep() {
+          if (!this.audioContext) {
+            this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+          }
+          if (this.audioContext.state === 'suspended') {
+            this.audioContext.resume();
+          }
+          const oscillator = this.audioContext.createOscillator();
+          const gainNode = this.audioContext.createGain();
+          
+          oscillator.type = 'square';
+          oscillator.frequency.setValueAtTime(600, this.audioContext.currentTime);
+          
+          gainNode.gain.setValueAtTime(0.3, this.audioContext.currentTime);
+          gainNode.gain.exponentialRampToValueAtTime(0.01, this.audioContext.currentTime + 0.5);
+          
+          oscillator.connect(gainNode);
+          gainNode.connect(this.audioContext.destination);
+          
+          oscillator.start();
+          oscillator.stop(this.audioContext.currentTime + 0.5);
+        }
+
+        createMinion() {
+          const minion = new THREE.Group();
+
+          // Material Warna Minion
+          const yellowMat = new THREE.MeshPhongMaterial({ color: 0xFCE029 });
+          const blueMat = new THREE.MeshPhongMaterial({ color: 0x4285F4 });
+          const greyMat = new THREE.MeshPhongMaterial({ color: 0xAAAAAA });
+          const blackMat = new THREE.MeshPhongMaterial({ color: 0x222222 });
+          const whiteMat = new THREE.MeshPhongMaterial({ color: 0xFFFFFF });
+
+          // Tubuh (Kapsul Kuning)
+          const bodyGeo = new THREE.CapsuleGeometry(0.15, 0.3, 4, 16);
+          const body = new THREE.Mesh(bodyGeo, yellowMat);
+          body.position.y = 0.3;
+          minion.add(body);
+
+          // Baju Kodok / Celana (Silinder Biru di Bawah)
+          const pantsGeo = new THREE.CylinderGeometry(0.155, 0.155, 0.15, 16);
+          const pants = new THREE.Mesh(pantsGeo, blueMat);
+          pants.position.y = 0.225;
+          minion.add(pants);
+
+          // Tali Kacamata Hitam
+          const strapGeo = new THREE.CylinderGeometry(0.152, 0.152, 0.05, 16);
+          const strap = new THREE.Mesh(strapGeo, blackMat);
+          strap.position.y = 0.45;
+          minion.add(strap);
+
+          // Bingkai Kacamata Abu-abu (Mata Satu)
+          const frameGeo = new THREE.CylinderGeometry(0.07, 0.07, 0.03, 16);
+          const frame = new THREE.Mesh(frameGeo, greyMat);
+          frame.rotation.x = Math.PI / 2;
+          frame.position.set(0, 0.45, 0.15);
+          minion.add(frame);
+
+          // Bola Mata Putih
+          const eyeGeo = new THREE.SphereGeometry(0.06, 16, 16);
+          const eye = new THREE.Mesh(eyeGeo, whiteMat);
+          eye.position.set(0, 0.45, 0.15);
+          minion.add(eye);
+
+          // Pupil Hitam
+          const pupilGeo = new THREE.SphereGeometry(0.015, 16, 16);
+          const pupil = new THREE.Mesh(pupilGeo, blackMat);
+          pupil.position.set(0, 0.45, 0.205);
+          minion.add(pupil);
+
+          // Kaki
+          const legGeo = new THREE.CylinderGeometry(0.03, 0.03, 0.1, 16);
+          const legL = new THREE.Mesh(legGeo, blueMat);
+          legL.position.set(-0.06, 0.1, 0);
+          minion.add(legL);
+          
+          const legR = new THREE.Mesh(legGeo, blueMat);
+          legR.position.set(0.06, 0.1, 0);
+          minion.add(legR);
+
+          // Sepatu Hitam
+          const shoeGeo = new THREE.BoxGeometry(0.06, 0.04, 0.08);
+          const shoeL = new THREE.Mesh(shoeGeo, blackMat);
+          shoeL.position.set(-0.06, 0.05, 0.02);
+          minion.add(shoeL);
+
+          const shoeR = new THREE.Mesh(shoeGeo, blackMat);
+          shoeR.position.set(0.06, 0.05, 0.02);
+          minion.add(shoeR);
+
+          return minion;
+        }
+      }
+
+      document.addEventListener('DOMContentLoaded', function () {
+        const options = new xb.Options();
+        options.enableUI();
+        options.enableReticles(); // Mendukung mode AR/Passthrough jika tersedia di perangkat
+        options.enableAI(); // Mengaktifkan modul Gemini AI
+        
+        xb.add(new RadiologiAR());
+        xb.init(options);
+      });
+    </script>
+  </body>
+</html>
